@@ -10,7 +10,7 @@ from PIL import Image
 from tqdm import tqdm
 import albumentations
 import segmentation_models_pytorch as smp
-
+from skimage.morphology import skeletonize
 # =========================================================
 # 1. 執行環境與模型配置
 # =========================================================
@@ -170,7 +170,32 @@ def predict_one_image(img_path, threshold=0.5):
         cvc_path_prob = prob_map[0]
         pred_mask = (cvc_path_prob >= threshold).astype(np.uint8)
     return pred_mask
+def cldice_coefficient(y_true, y_pred):
+    """
+    計算 Centerline Dice (clDice)
+    y_true, y_pred: 二值化的 numpy array (0 或 1)
+    """
+    # 確保輸入是布林或 0/1 格式
+    y_true = y_true.astype(bool)
+    y_pred = y_pred.astype(bool)
 
+    # 1. 提取骨架 (Skeletonization)
+    if np.sum(y_true) == 0 or np.sum(y_pred) == 0:
+        return 0.0
+        
+    t_skeleton = skeletonize(y_true)
+    p_skeleton = skeletonize(y_pred)
+    
+    # 2. 計算 Tps (Topology-preserving Sensitivity)
+    # 預測的骨架落入真實 Mask 的比例
+    tps = np.sum(p_skeleton * y_true) / (np.sum(p_skeleton) + 1e-6)
+    
+    # 3. 計算 Vcl (Topology-preserving Precision)
+    # 真實的骨架落入預測 Mask 的比例
+    vcl = np.sum(t_skeleton * y_pred) / (np.sum(t_skeleton) + 1e-6)
+    
+    # 4. 計算 clDice
+    return 2.0 * tps * vcl / (tps + vcl + 1e-6)
 # =========================================================
 # 5. 批次執行主程式
 # =========================================================
@@ -210,14 +235,15 @@ def run_evaluation():
                 true_mask = cv2.resize(true_mask_raw, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_NEAREST)
                 true_mask = (true_mask > 127).astype(np.uint8)
 
-                # 3. 計算 Dice 與 IoU
                 dice_score = dice_coefficient(true_mask, pred_mask)
                 iou_score = iou_coefficient(true_mask, pred_mask)
+                cldice_score = cldice_coefficient(true_mask, pred_mask) # <--- 新增
                 
                 group_results.append({
                     "filename": filename,
                     "dice_score": dice_score,
-                    "iou_score": iou_score
+                    "iou_score": iou_score,
+                    "cldice_score": cldice_score # <--- 新增
                 })
 
             except Exception as e:
@@ -227,7 +253,8 @@ def run_evaluation():
         if group_results:
             df_detail = pd.DataFrame(group_results)
             mean_dice = df_detail["dice_score"].mean()
-            mean_iou = df_detail["iou_score"].mean()  # 這就是 mIoU
+            mean_iou = df_detail["iou_score"].mean()
+            mean_cldice = df_detail["cldice_score"].mean() # <--- 新增
             
             detail_path = os.path.join(OUTPUT_DETAIL_DIR, f"{name}_metrics_details.csv")
             df_detail.to_csv(detail_path, index=False, encoding="utf-8-sig")
@@ -236,9 +263,10 @@ def run_evaluation():
                 "Group_Name": name,
                 "Image_Count": len(df_detail),
                 "mDice": mean_dice,
-                "mIoU": mean_iou
+                "mIoU": mean_iou,
+                "mclDice": mean_cldice # <--- 新增
             })
-            print(f"✅ {name} 評估完成。mDice: {mean_dice:.4f}, mIoU: {mean_iou:.4f}")
+            print(f"✅ {name} 評估完成。mDice: {mean_dice:.4f}, mclDice: {mean_cldice:.4f}")
     # 5. 產出總表
     if summary_data:
         df_summary = pd.DataFrame(summary_data)
