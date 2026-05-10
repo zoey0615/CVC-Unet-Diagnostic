@@ -7,10 +7,11 @@ import torch
 import torch.nn as nn #Neural Networks（神經網路）。 PyTorch 中專門建立、訓練、以及優化深度學習模型而設計的子庫（Sub-library）。
 import albumentations #影像增強
 import segmentation_models_pytorch as smp #基於 PyTorch 的開源套件，專門為影像分割任務提供了大量預先寫好的模型架構、編碼器與損失函數。
-import torchxrayvision as xrv #定位 Carina (氣管分叉點)
+import carinanet
 from PIL import Image
 import pandas as pd
 import time
+from skimage.morphology import skeletonize
 
 # ─── Configuration ────────────────
 IMAGE_SIZE  = 1024
@@ -71,18 +72,7 @@ def load_models():
 print("Loading UNet++ Models...")
 MODELS = load_models()
 
-print("Loading XRV Model (Universal Interface)...")
-# 使用最通用的 DenseNet 模型，並指定使用具有 15 個特徵點輸出的權重
-try:
-    LANDMARK_MODEL = xrv.models.DenseNet(weights="all").to(DEVICE).eval() #指定載入在多個大型 X 光資料集（NIH, CheXpert, MIMIC 等）混合訓練出的最強通用權重。
-    MODEL_MODE = "universal_densenet"
-    print("Using Universal DenseNet (All weights).")
-except Exception as e:
-    print(f"Failed to load preferred model, trying fallback: {e}")
-    # 最終備案：如果連權重都抓不到，則不執行解剖點偵測，避免程式崩潰
-    LANDMARK_MODEL = None
-    MODEL_MODE = "none"
-    print("Warning: No Landmark Model loaded. Carina detection will be disabled.")
+
 
 # ─── Logic Functions ─────mask-> points
 def extract_path_points(mask, sample_step=15):
@@ -105,54 +95,72 @@ def extract_path_points(mask, sample_step=15):
         
     return str(sampled_pts)
 
+def get_ordered_path(clip_mask):
+    # 1. 骨架化：將粗大的導管縮減為 1 像素寬的線
+    skeleton = skeletonize(clip_mask > 0).astype(np.uint8)
+    
+    # 2. 找到骨架上的點
+    points = np.column_stack(np.where(skeleton > 0)) # 回傳 [[y, x], ...]
+    
+    # 3. 如果點太少，直接回傳
+    if len(points) < 10: return points
+    
+    # 4. 排序點 (簡單做法：以 y 座標排序，假設導管是縱向走)
+    # 進階做法可以使用鄰近演算法 (Nearest Neighbor) 來重排序列
+    ordered_points = points[points[:, 0].argsort()] 
+    return ordered_points
 def detect_carina(image_np):
-    """
-    偵測 Carina 位置，整合 CLAHE 增強、模型預測、座標限制與解剖比例備案。
-    """
-    if LANDMARK_MODEL is None:
-        # 備案：解剖學經驗位置 (水平置中，垂直約影像 40-45% 處)
-        return int(0.42 * IMAGE_SIZE), int(0.5 * IMAGE_SIZE)
+    h, w = image_np.shape[:2]
+    
+    # 預處理
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    input_image = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2RGB)
+
+    fallback_x, fallback_y = int(0.5 * w), int(0.42 * h)
 
     try:
-        # 1. 影像預處理：使用 CLAHE 增強氣管黑影對比度
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY) #將彩色圖轉為灰階，因為解剖點偵測不需要顏色資訊。
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) #限制對比度自適應直方圖均衡化
-        enhanced_gray = clahe.apply(gray) #CLAHE 物件的方法（Method）。它負責執行實際的數學運算
+        result = carinanet.predict_carina_ett(input_image)
+        car = result.get("carina", None)
         
-        # 縮放與正規化
-        resized = cv2.resize(enhanced_gray, (224, 224)).astype(np.float32) #將輸入的影像 enhanced_gray 強制調整為寬 224 像素、高 224 像素。
-        xrv_img = (resized / 255.0) * 2048.0 - 1024.0 # 將0~255的像素值縮小到0~1（除以 255），接著映射到 -1024到 1024之間。
-        xrv_tensor = torch.from_numpy(xrv_img).unsqueeze(0).unsqueeze(0).to(DEVICE) #將 NumPy 的 ndarray（矩陣）轉換成 PyTorch 的 Tensor（張量）。 再次在索引為 0的位置增加一個維度。
-        with torch.no_grad(): #測（推論）階段，關閉梯度計算。
-            preds = LANDMARK_MODEL(xrv_tensor) #是模型對該張 X 光片的特徵點預測
-            
-            # 2. 座標提取與邏輯檢查
-            if preds.ndim == 3 and preds.shape[1] > 9:  # 確保是 Landmark 格式
-                p_x = preds[0, 9, 0].item() #Carina（氣管分叉點） 座標
-                p_y = preds[0, 9, 1].item() #把張量轉成 Python 的浮點數，方便後續計算。
-                # 將 [-1, 1] 轉為 [0, 1] 比例
-                car_x_norm = (p_x + 1.0) / 2.0 #將座標轉化為百分比（比例）。
-                car_y_norm = (p_y + 1.0) / 2.0
-                
-                # 3. 座標範圍限制 (Coordinate Clipping):Carina 理論上應在影像中線附近 (0.4~0.6) 且在上半部 (0.3~0.55)
-                #np.clip(目標值, 最小值, 最大值)
-                car_x_norm = np.clip(car_x_norm, 0.35, 0.48) #在標準胸部 X 光中，氣管分叉點（Carina）通常位於影像中心線偏左一點
-                car_y_norm = np.clip(car_y_norm, 0.48, 0.52) #Carina 大約位於胸腔高度的一半處（第四、五胸椎附近）。
-                final_x = int(car_x_norm * IMAGE_SIZE) #將0~1的比例，乘上圖片的真實像素尺寸
-                final_y = int(car_y_norm * IMAGE_SIZE)
-                return final_x, final_y
-            
-            else:
-                # 如果模型維度不符 (例如只輸出疾病分類)，回傳解剖比例位置
-                print("Landmark shape mismatch, using fallback.")
-                return int(0.42 * IMAGE_SIZE), int(0.5 * IMAGE_SIZE)
-                
+        if car is None:
+            return fallback_x, fallback_y
+
+        # 從數據看，(303.5, 186.5) -> 303.5 才是 X
+        # 所以我們應該這樣賦值：
+        val1, val2 = car[0], car[1]
+        
+        # 自動邏輯判斷：在 640 空間中，X 通常在中間 (250-400)，
+        # 而 Carina 的 Y (高度) 通常比較淺 (150-250)。
+        if val1 > val2:
+            x_raw, y_raw = val1, val2
+        else:
+            x_raw, y_raw = val2, val1
+
+        MODEL_SIZE = 640.0
+        scale_w = w / MODEL_SIZE
+        scale_h = h / MODEL_SIZE
+
+        # 最終轉換
+        final_x = int(x_raw * scale_w)
+        final_y = int(y_raw * scale_h)
+
+        # 二次安全檢查：確保 X 不會偏離中線太遠
+        if not (w * 0.35 < final_x < w * 0.65):
+            print("⚠️ 比例異常，改用 Fallback X")
+            final_x = fallback_x
+
+        print(f"🎯 修正完成 -> X: {final_x}, Y: {final_y} (原始: {car})")
+        return final_x, final_y
+
     except Exception as e:
-        print(f"Landmark detection logic error: {e}")
-        # 發生任何錯誤時，回傳最穩定的解剖參考點
-        return int(0.42 * IMAGE_SIZE), int(0.5 * IMAGE_SIZE)
+        print(f"❌ 偵測失敗: {e}")
+        return fallback_x, fallback_y
 #計算導管尖端（Tip）與解剖基準點（Carina）的相對位置，並根據醫學臨床準則給出診斷標籤。
-def check_malposition(tip_y, car_y, tip_x, car_x):
+def check_malposition(tip_y, car_y, tip_x, car_x, is_looping_up=False):
+    if is_looping_up:
+        return "Abnormal (Upward Malposition)", (0, 0, 255)
     if tip_y is None or car_y is None: return "Unknown", (128, 128, 128) #如果其中一個點沒抓到（None），系統會回傳 "Unknown" 並顯示灰色 (128, 128, 128)。
     y_diff = tip_y - car_y #縱向位移：決定深淺(>0導管在carina下方)
     x_diff = abs(tip_x - car_x) #橫向位移：決定是否誤入血管
@@ -187,47 +195,65 @@ def segment(pil_image, threshold_pct: float, alpha_pct: float):   #門檻值百�
     
     # 2. 找出所有尖端連通域 (不只取最大的一個)
     contours, _ = cv2.findContours(tip_mask_raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) #Retrieve(檢索/取回) External(外部的) (Contours Only)、(簡單鏈式逼近演算法): 使用外部輪廓檢索(RETR_EXTERNAL)與鏈碼逼近(CHAIN_APPROX_SIMPLE)提取尖端候選區域
-    valid_contours = [c for c in contours if cv2.contourArea(c) > 5]
-    num_tips = len(valid_contours)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 5] #計算輪廓 c 所包圍的面積（像素個數） [ 想要留下來的東西 | 來源 | 過濾條件 ]
+    num_tips = len(valid_contours) #有效輪廓數量。
     
-    clean_tip_mask = np.zeros_like(tip_mask_raw)
+    clean_tip_mask = np.zeros_like(tip_mask_raw) #利用 NumPy 建立一個全為 0（黑色）的矩陣。與尖端相同大小
     all_tip_coords = [] # 用來存所有偵測到的尖端中心點
 
-    for cnt in valid_contours:
-        # 把所有有效的尖端都畫到 clean_tip_mask 上
+    for cnt in valid_contours: #遍歷有效輪廓清單
+        # 把所有有效的尖端填滿畫到 clean_tip_mask 上
         cv2.drawContours(clean_tip_mask, [cnt], -1, 255, -1)
         
         # 計算每個連通域的中心點
-        M = cv2.moments(cnt)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
+        M = cv2.moments(cnt) #計算輪廓 cnt 的所有空間矩（Spatial Moments）。空間權重*像素值
+        if M["m00"] != 0: #檢查零階矩 $m_{00}$（即面積）是否不等於零。
+            cx = int(M["m10"] / M["m00"]) #總力矩」除以「總重量」，得到的結果就是這塊形狀的 「平衡點（質心）」。
             cy = int(M["m01"] / M["m00"])
             all_tip_coords.append([cx, cy])
 
-    # 3. 診斷邏輯：如果有多個點，我們通常以「最深/最下方」的點作為與 Carina 比較的 Tip
-    # 這裡假設 y 座標越大代表位置越深
-    main_tip_x, main_tip_y = None, None
-    if all_tip_coords:
-        # 找 y 座標最大的點作為主要的尖端 (Tip)
+# 3. 診斷邏輯
+    main_tip_x, main_tip_y = None, None 
+    is_looping_up = False # 預設方向正確
+    path_points = get_ordered_path(clip_mask)
+
+    if len(path_points) > 20 and len(all_tip_coords) > 0:
+        tail_segment = path_points[-15:] # 稍微增加觀察樣本
+        y_start_tail = tail_segment[0][0] 
+        y_end_tail = tail_segment[-1][0]  
+        
+        # 判定方向：y 越小越高，所以終點 y 小於 起點 y 代表正在往上
+        if y_end_tail < y_start_tail - 5: # 增加 5 像素的容錯
+            is_looping_up = True
+    
+        # 尋找與導管末端最接近的 Tip
+        last_path_point = (path_points[-1][1], path_points[-1][0]) 
+        best_tip = min(all_tip_coords, key=lambda p: np.linalg.norm(np.array(p) - np.array(last_path_point)))
+        main_tip_x, main_tip_y = best_tip[0], best_tip[1]
+    elif all_tip_coords:
+        # 備案邏輯：如果路徑太短，回歸 y 座標最大法
         best_tip = max(all_tip_coords, key=lambda p: p[1])
         main_tip_x, main_tip_y = best_tip[0], best_tip[1]
 
-    # 4. 提取路徑點位 (包含所有亮點區域的座標)
-    full_data_path =extract_path_points(clip_mask, sample_step=20)
-
-    # 診斷與視覺化
-    label, color_bgr = check_malposition(main_tip_y, car_y, main_tip_x, car_x)
+    # 執行統一診斷
+    label, color_bgr = check_malposition(main_tip_y, car_y, main_tip_x, car_x, is_looping_up)
     overlay = make_overlay(original_np, prob_map, threshold, alpha)
     
     # 繪製 Carina
     if car_x and car_y:
         cv2.circle(overlay, (car_x, car_y), 10, (255, 255, 255), -1)
         cv2.circle(overlay, (car_x, car_y), 7, (0, 255, 255), -1) 
-    
-    # 繪製所有偵測到的尖端 (用藍色圈起來)
+
+# 1. 先用藍色畫出「所有」偵測到的尖端候選點 (作為底色)
     for tx, ty in all_tip_coords:
-        cv2.circle(overlay, (tx, ty), 10, (255, 255, 255), -1)
-        cv2.circle(overlay, (tx, ty), 7, (255, 0, 0), -1) 
+        cv2.circle(overlay, (tx, ty), 10, (255, 255, 255), -1) # 白邊
+        cv2.circle(overlay, (tx, ty), 7, (255, 0, 0), -1)    # 藍色中心 (BGR: 255, 0, 0)
+
+    # 2. 針對與 Carina 比較的那一個「主尖端」，覆蓋上不同的顏色（例如：紅色或紫色）
+    if main_tip_x is not None and main_tip_y is not None:
+        # 這裡我們用紅色 (BGR: 0, 0, 255) 來標註最終診斷用的點
+        cv2.circle(overlay, (main_tip_x, main_tip_y), 11, (255, 255, 255), -1) # 稍微大一點點的白邊
+        cv2.circle(overlay, (main_tip_x, main_tip_y), 8, (0, 0, 255), -1)      # 紅色中心
 
     mask_rgb = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
     mask_rgb[:, :, 1] = clip_mask  
@@ -236,7 +262,7 @@ def segment(pil_image, threshold_pct: float, alpha_pct: float):   #門檻值百�
     save_status = ""
     # 修改存檔條件：只要偵測到尖端就存檔，不論 1 個還是多個
     if num_tips >= 1:
-        base_dir = "output_masks"
+        base_dir = r"C:\WorkArea\zoey\unet\output_masks"
         for d in ["masks", "overlays", "originals", "csv"]: os.makedirs(os.path.join(base_dir, d), exist_ok=True)
         ts = int(time.time() * 1000) #Python 的時間模組，回傳自 1970 年 1 月 1 日 00:00:00 (UTC) 以來的總秒數。
         mask_path = os.path.join(base_dir, "masks", f"mask_{ts}.png")
@@ -247,17 +273,25 @@ def segment(pil_image, threshold_pct: float, alpha_pct: float):   #門檻值百�
         cv2.imwrite(mask_path, cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
         cv2.imwrite(over_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         cv2.imwrite(orig_path, cv2.cvtColor(original_np, cv2.COLOR_RGB2BGR))
-        
+        full_data_path = str(all_tip_coords)
+        full_clip_path = extract_path_points(clip_mask, sample_step=15) 
+
+        # 3. 修改 DataFrame 內容
         df_row = pd.DataFrame([{
             "StudyInstanceUID": ts, 
             "label": f"CVC - {label}", 
-            "data": full_data_path, # 這裡會存入 [[x1,y1], [x2,y2]]
+            "data": full_data_path,        # 這裡是尖端點
+            "clip_path_data": full_clip_path, # 這是新增的欄位：整條導管的座標
             "ts": ts, 
-            "tx": main_tip_x, "ty": main_tip_y, # 主要 Tip
+            "tx": main_tip_x, "ty": main_tip_y, 
             "cx": car_x, "cy": car_y,
-            "mask_file": mask_path, "overlay_file": over_path, "original_file": orig_path,
-            "num_tips_detected": num_tips # 額外紀錄偵測到的點數
+            "mask_file": mask_path, 
+            "overlay_file": over_path, 
+            "original_file": orig_path,
+            "num_tips_detected": num_tips 
         }])
+        
+        # 存檔指令保持不變
         df_row.to_csv(csv_path, mode='a', index=False, header=not os.path.exists(csv_path), encoding='utf-8-sig')
         save_status = f"💾 已偵測到 {num_tips} 個尖端並存檔。"
     else:
@@ -268,35 +302,36 @@ def segment(pil_image, threshold_pct: float, alpha_pct: float):   #門檻值百�
 
 # ─── UI Layout ────────────────────────────────────────────────────────────────
  #[容器層開始] - 這是一張大地圖
-with gr.Blocks(title="CVC Position Diagnostic", theme='gstaff/sketch') as demo: #數定義網頁分頁標籤上的名稱。
-    gr.Markdown("# 🏥 CVC Position Auto-Diagnostic App") #渲染 Markdown 格式的文字。它會將你輸入的字串轉換成 HTML 顯示在網頁上。
+def build_carina_page():
+    gr.Markdown("# 🏥 CVC Position Auto-Diagnostic App")
     gr.Markdown("支援 **即時標籤顯示** 與 **自動分類存檔**")
-    
-    with gr.Row(): #列布局(第一列)
-        with gr.Column(scale=1): #第一欄(佔 1/2 寬度)
+
+    with gr.Row():
+        with gr.Column(scale=1):
             img_in = gr.Image(type="pil", label="上傳 CXR 影像")
-            with gr.Row(): #在 Column 的中間插入一個水平導軌
-                sld_thr = gr.Slider(1, 99, value=50, label="閾值 Threshold (%)") #gr.Slider(minimum, maximum, value, label)
+            with gr.Row():
+                sld_thr = gr.Slider(1, 99, value=50, label="閾值 Threshold (%)")
                 sld_alp = gr.Slider(10, 90, value=45, label="透明度 Alpha (%)")
             run_btn = gr.Button("🔍 執行分析", variant="primary")
-            
-        with gr.Column(scale=1):  #第2欄(佔 1/2 寬度)
-            # 新增：診斷結果標籤顯示
+
+        with gr.Column(scale=1):
             out_label = gr.Label(label="診斷分類結果", num_top_classes=1)
-            
             with gr.Tab("Overlay Result"):
                 out_over = gr.Image(label="Overlay")
             with gr.Tab("Binary Mask"):
                 out_mask = gr.Image(label="Mask")
-            
             status = gr.Markdown("### 狀態: Ready.")
-    
-    # 點擊事件回傳值順序需與 segment 函式 return 順序一致
+
     run_btn.click(
-        fn=segment, 
-        inputs=[img_in, sld_thr, sld_alp],  #按照 inputs 列表中的順序，把元件裡的值一個一個給 segment 函式。
+        fn=segment,
+        inputs=[img_in, sld_thr, sld_alp],
         outputs=[out_mask, out_over, out_label, status]
     )
 
+    back_btn = gr.Button("⬅ 返回大廳", variant="secondary")
+    return back_btn
+
 if __name__ == "__main__":
+    with gr.Blocks() as demo:
+        build_carina_page()
     demo.launch(server_port=12356) # [啟動層] - 把地圖發布到網路上
